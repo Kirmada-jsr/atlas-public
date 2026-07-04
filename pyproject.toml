@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-sonar"
+version = "0.1.0"
+description = "Atlas: retrieval and composition in SONAR embedding space — ask questions against a pretrained fact memory."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Vatsal Srivastava", email = "vatsal.srivastava78@gmail.com" }]
+keywords = ["sentence-embeddings", "SONAR", "retrieval", "composition", "modular-language-models"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.35",
+    "huggingface_hub>=0.20",
+    "numpy",
+    "sentencepiece",
+]
+
+[project.optional-dependencies]
+demo = ["gradio>=4"]
+
+[project.scripts]
+atlas = "atlas.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Kirmada-jsr/atlas-public"
+
+[tool.setuptools]
+packages = ["atlas"]
