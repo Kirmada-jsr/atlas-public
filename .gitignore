@@ -1,0 +1,8 @@
+# Internal-only — never push
+PLAN.md
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/

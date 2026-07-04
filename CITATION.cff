@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use Atlas, please cite this repository."
+title: "Atlas: Retrieval and Composition in SONAR Embedding Space"
+abstract: >-
+  A modular retrieval-composition system that operates directly in SONAR
+  multilingual embedding space. A learned query encoder retrieves the top-K
+  most relevant sentence embeddings from a large pool, and a separately
+  trained composer folds them into a single paragraph-level SONAR embedding,
+  which can be decoded back into natural language.
+type: software
+authors:
+  - family-names: Srivastava
+    given-names: Vatsal
+    email: vatsal.srivastava78@gmail.com
+version: 0.1.0
+date-released: "2026-07-04"
+url: "https://github.com/Kirmada-jsr/atlas-public"
+repository-code: "https://github.com/Kirmada-jsr/atlas-public"
+license: Apache-2.0
+keywords:
+  - sentence-embeddings
+  - SONAR
+  - retrieval
+  - composition
+  - modular-language-models
