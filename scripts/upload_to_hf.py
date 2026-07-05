@@ -3,10 +3,10 @@
 Run on the machine that holds the trained artifacts (the GPU box):
 
     python scripts/upload_to_hf.py \
-        --retriever-ckpt ~/Atlas/atlas/experiments/atlas_v5.1/retriever-checkpoints/atlas_sonar_retriever.pt \
-        --composer-ckpt  ~/Atlas/atlas/experiments/atlas_v5.1/atlas_sonar_composer.pt \
-        --encoded        ~/Atlas/atlas/experiments/atlas_v5.1/atlas_sonar_data_400k/msmarco_encoded.pt \
-        --para-targets   ~/Atlas/atlas/experiments/atlas_v5.1/atlas_sonar_data_400k/para_targets.pt \
+        --retriever-ckpt path/to/retriever.pt \
+        --composer-ckpt  path/to/composer.pt \
+        --encoded        path/to/msmarco_encoded.pt \
+        --para-targets   path/to/para_targets.pt \
         --tag v0.1.0
 
 Requires a logged-in HF account with write access (`hf auth login`).

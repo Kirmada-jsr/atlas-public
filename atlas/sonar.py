@@ -4,8 +4,8 @@ Lazy-loads the SONAR encoder (question/text -> embedding) and decoder
 (embedding -> text) from their public Hugging Face repos. Both are frozen;
 Atlas never fine-tunes SONAR.
 
-Ported behavior-for-behavior from the validated dev inference script
-(`atlas_run.py`): attention-masked mean pooling for encoding, and
+Ported behavior-for-behavior from the validated dev inference
+implementation: attention-masked mean pooling for encoding, and
 encoder-output injection + beam search for decoding. Do not change the
 pooling or generation settings — the released Atlas weights were validated
 against exactly these.
