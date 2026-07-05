@@ -19,7 +19,7 @@ entirely in embedding space.
 ## Quickstart
 
 ```bash
-pip install atlas-sonar
+pip install "atlas-sonar @ git+https://github.com/Kirmada-jsr/atlas-public@v0.1.0"
 atlas ask "what is dobutamine used for?"
 ```
 
@@ -38,7 +38,8 @@ result.embedding   # the composed SONAR vector itself
 ```
 
 `atlas repl` gives you an interactive loop; `atlas serve` launches a local
-Gradio demo (`pip install 'atlas-sonar[demo]'`).
+Gradio demo
+(`pip install "atlas-sonar[demo] @ git+https://github.com/Kirmada-jsr/atlas-public@v0.1.0"`).
 
 > **First run downloads ~6.5 GB** (weights ~55 MB, fact index ~5 GB, SONAR
 > encoder/decoder ~1.2 GB), cached under `~/.cache/huggingface`. Every later
@@ -86,8 +87,16 @@ Hugging Face Hub and are downloaded automatically.
 ## Versioning
 
 Package version, git tag, and Hugging Face artifact revision move together:
-`pip install atlas-sonar==X.Y.Z` always loads the weights tagged `vX.Y.Z`.
-See [CHANGELOG.md](CHANGELOG.md).
+installing from the git tag `vX.Y.Z` always loads the weights tagged
+`vX.Y.Z` — code and weights cannot drift apart. See
+[CHANGELOG.md](CHANGELOG.md).
+
+## Technical report
+
+The full technical report for each major release — architecture with tensor
+shapes, the end-to-end inference path, training procedure, and measured
+performance — lives in [release-reports/](release-reports/). Current:
+[ATLAS v0.1.0](release-reports/ATLAS_v0.1.0_Technical_Report.md).
 
 ## Citation
 
