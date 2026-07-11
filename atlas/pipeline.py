@@ -12,6 +12,12 @@ version) and assembles the full ask pipeline:
 
 The retrieval / composition math is ported behavior-for-behavior from the
 validated dev inference script. Public-facing outputs are identical to it.
+
+v0.1.1: retrieval scores never enter the composer. They are used only to
+SELECT which retrieved sentences are composed, via the relative drop-off
+rule ``alpha``: keep sentence i iff score_i >= alpha * score_1 (top-1 is
+always kept; alpha <= 0 keeps all k). The composer takes a variable number
+of inputs (trained on K = 1..4).
 """
 
 from __future__ import annotations
@@ -33,7 +39,10 @@ RETRIEVER_FILE = "retriever.pt"
 COMPOSER_FILE = "composer.pt"
 ENCODED_FILE = "msmarco_encoded.pt"
 PARA_TARGETS_FILE = "para_targets.pt"
+MANIFEST_FILE = "manifest.json"
 
+# Retained for backward compatibility only; score_mode is deprecated and
+# ignored (the c0.1.1 composer takes no scores).
 _SCORE_MODES = ("uniform", "retriever")
 
 
@@ -64,6 +73,7 @@ class AtlasResult:
     answer: Optional[str]                      # decoded paragraph; None if decode=False
     retrieved: List[Tuple[str, float]]         # (sentence, raw retriever cosine score)
     retrieved_indices: List[int] = field(default_factory=list)  # pool indices of `retrieved`
+    kept: List[bool] = field(default_factory=list)  # alpha-selection survivors (composed subset)
     passages: List[Dict] = field(default_factory=list)
     # each: {"question": str, "sentences": List[str], "similarity": float,
     #        "index": int}
@@ -82,6 +92,7 @@ class Atlas:
         sonar: Sonar,
         device: torch.device,
         chunk_size: int = 4096,
+        alpha: float = 0.0,
     ):
         self.query_enc = query_enc
         self.scorer = scorer
@@ -89,6 +100,8 @@ class Atlas:
         self.sonar = sonar
         self.device = device
         self.chunk_size = chunk_size
+        self.alpha = alpha
+        self.manifest: Optional[Dict] = None
 
         self.questions: List[str] = data["questions"]
         self.sentences: List[str] = data["sentences"]
@@ -111,6 +124,7 @@ class Atlas:
         encoder_model: str = DEFAULT_ENCODER,
         decoder_model: str = DEFAULT_DECODER,
         chunk_size: int = 4096,
+        alpha: float = 0.0,
     ) -> "Atlas":
         """Download weights + fact index from the HF Hub and build the pipeline.
 
@@ -119,14 +133,19 @@ class Atlas:
             index_repo:  HF dataset repo with the fact pool
                          (``msmarco_encoded.pt`` / ``para_targets.pt``).
             revision:    HF revision. Defaults to the tag matching this
-                         package version (e.g. ``v0.1.0``) so code and weights
+                         package version (e.g. ``v0.1.1``) so code and weights
                          can never mismatch. Pass ``"main"`` to track latest.
             device:      ``"auto"`` (cuda > mps > cpu), or explicit.
             pool_device: Optionally keep the fact pool resident on this device
                          (e.g. ``"cuda"``) instead of streaming CPU->GPU chunks
                          per query. Identical results, more memory.
             chunk_size:  Sentences per scoring chunk during retrieval.
+            alpha:       Default selection threshold for ``ask()``: keep
+                         retrieved sentence i iff score_i >= alpha * score_1
+                         (top-1 always kept; <= 0 keeps all k).
         """
+        import json
+
         from huggingface_hub import hf_hub_download
         from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
 
@@ -163,6 +182,18 @@ class Atlas:
         composer.load_state_dict(c_ckpt["composer"])
         composer.eval()
 
+        # --- component manifest (descriptive provenance; optional) ---
+        manifest = None
+        try:
+            manifest_path = hf_hub_download(model_repo, MANIFEST_FILE, revision=rev)
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            comps = manifest.get("components", {})
+            comp_str = "  ".join(f"{name}={c.get('version', '?')}" for name, c in comps.items())
+            print(f"  Components: {comp_str}")
+        except EntryNotFoundError:
+            pass  # pre-manifest releases (v0.1.0)
+
         # --- fact index (kept on CPU unless pool_device is set) ---
         print("  Loading fact index (this can take a minute)...")
         data = torch.load(encoded_path, map_location="cpu", weights_only=False)
@@ -172,6 +203,7 @@ class Atlas:
         # (no effect on any output).
         data.pop("q_embs", None)
         pt.pop("first3_indices", None)
+        pt.pop("firstK_indices", None)
 
         if pool_device is not None:
             pd = torch.device(pool_device)
@@ -184,7 +216,9 @@ class Atlas:
         )
 
         sonar = Sonar(encoder_model, decoder_model, device=dev)
-        return cls(query_enc, scorer, composer, data, sonar, dev, chunk_size)
+        atlas = cls(query_enc, scorer, composer, data, sonar, dev, chunk_size, alpha)
+        atlas.manifest = manifest
+        return atlas
 
     # ------------------------------------------------------------------
     # Retrieval
@@ -250,7 +284,7 @@ class Atlas:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def retrieve(self, question: str, k: int = 3) -> List[Tuple[str, float]]:
+    def retrieve(self, question: str, k: int = 4) -> List[Tuple[str, float]]:
         """Retrieve the top-k fact sentences for a question (no composition)."""
         q_emb = self.sonar.encode(question)
         top_scores, top_indices = self._retrieve_topk(q_emb, k)
@@ -263,37 +297,52 @@ class Atlas:
     def ask(
         self,
         question: str,
-        k: int = 3,
-        score_mode: str = "uniform",
+        k: int = 4,
+        alpha: Optional[float] = None,
         n_neighbors: int = 5,
         decode: bool = True,
+        score_mode: Optional[str] = None,
     ) -> AtlasResult:
-        """Full pipeline: encode -> retrieve top-k -> compose -> decode.
+        """Full pipeline: encode -> retrieve top-k -> select -> compose -> decode.
 
         Args:
             question:    Natural-language question.
             k:           Number of fact sentences to retrieve.
-            score_mode:  ``"uniform"`` (default; validated) feeds the composer
-                         uniform 1/k scores, matching how it was trained.
-                         ``"retriever"`` feeds the raw retrieval scores instead
-                         (the pre-fix behavior, kept for experimentation).
+            alpha:       Selection threshold: keep sentence i iff
+                         score_i >= alpha * score_1 (top-1 always kept;
+                         <= 0 keeps all k). Defaults to the instance
+                         ``alpha`` set at load time.
             n_neighbors: Stored passages to report near the composed vector.
             decode:      If False, skip SONAR decoding (``answer`` is None).
+            score_mode:  Deprecated and ignored. The composer no longer takes
+                         scores; retrieval scores only gate selection (alpha).
         """
-        if score_mode not in _SCORE_MODES:
-            raise ValueError(f"score_mode must be one of {_SCORE_MODES}, got {score_mode!r}")
+        if score_mode is not None:
+            import warnings
+
+            warnings.warn(
+                "score_mode is deprecated and ignored: the composer no longer "
+                "takes scores. Use alpha to control fact selection instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        a = self.alpha if alpha is None else alpha
 
         # Encode + retrieve
         q_emb = self.sonar.encode(question)
         top_scores, top_indices = self._retrieve_topk(q_emb, k)
 
-        # Compose (uniform scores by default — the composer was trained on
-        # uniform 1/K; feeding raw scores shifts its inputs additively).
-        z_topk = self.sent_embs[top_indices].unsqueeze(0).to(self.device)
-        scores = top_scores.unsqueeze(0).to(self.device)
-        if score_mode == "uniform":
-            scores = torch.full_like(scores, 1.0 / k)
-        composed = self.composer(z_topk, scores).squeeze(0).cpu()
+        # Select by the relative drop-off rule, then compose the survivors.
+        # Scores are used only for this selection; they never enter the
+        # composer.
+        if a > 0:
+            keep = top_scores >= a * top_scores[0]
+            keep[0] = True
+        else:
+            keep = torch.ones_like(top_scores, dtype=torch.bool)
+
+        z_kept = self.sent_embs[top_indices[keep]].unsqueeze(0).to(self.device)
+        composed = self.composer(z_kept).squeeze(0).cpu()
 
         # Grounding: nearest stored passages to the composed vector
         near_sims, near_idxs = self._nearest_passages(composed, n=n_neighbors)
@@ -317,6 +366,7 @@ class Atlas:
                 for i, s in zip(top_indices.tolist(), top_scores.tolist())
             ],
             retrieved_indices=top_indices.tolist(),
+            kept=keep.tolist(),
             passages=passages,
             embedding=composed,
         )

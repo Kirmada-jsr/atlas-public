@@ -76,9 +76,13 @@ class DotProductScorer(nn.Module):
 class Composer(nn.Module):
     """Folds K sentence SONAR embeddings into one paragraph-level embedding.
 
-    TransformerEncoder over the K inputs (with additive score conditioning),
-    mask-aware mean pooling, then an output MLP. Output is a raw SONAR-space
-    vector (no normalization) suitable for the SONAR decoder.
+    TransformerEncoder over the K inputs, mask-aware mean pooling, then an
+    output MLP. Output is a raw SONAR-space vector (no normalization)
+    suitable for the SONAR decoder.
+
+    Variable-K (c0.1.1): trained on K = 1..4 inputs; retrieval scores never
+    enter the composer (they only gate which facts reach it, via the alpha
+    selection rule in the pipeline).
     """
 
     def __init__(
@@ -89,12 +93,6 @@ class Composer(nn.Module):
     ):
         super().__init__()
         D = sonar_dim
-
-        # Score conditioning: scalar relevance score -> D, added to each input.
-        self.score_embed = nn.Sequential(
-            nn.Linear(1, D // 4), nn.GELU(),
-            nn.Linear(D // 4, D),
-        )
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=D,
@@ -115,11 +113,9 @@ class Composer(nn.Module):
     def forward(
         self,
         z_topk: torch.Tensor,                                # [B, K, D]
-        scores: torch.Tensor,                                # [B, K]
         src_key_padding_mask: Optional[torch.Tensor] = None,  # [B, K] True = pad
     ) -> torch.Tensor:                                       # [B, D]
-        x = z_topk + self.score_embed(scores.unsqueeze(-1))
-        h = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
+        h = self.transformer(z_topk, src_key_padding_mask=src_key_padding_mask)
 
         if src_key_padding_mask is not None:
             valid = (~src_key_padding_mask).float().unsqueeze(-1)

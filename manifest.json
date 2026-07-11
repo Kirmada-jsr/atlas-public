@@ -1,0 +1,19 @@
+{
+  "version": "0.1.1",
+  "components": {
+    "index": {
+      "version": "0.1.1",
+      "source": "dev v5.2 (para_targets rebuilt first-4; sentence pool unchanged from 0.1.0)"
+    },
+    "retriever": {
+      "version": "r0.1.0",
+      "params": 3150849,
+      "source": "dev v5.1 canonical (unchanged from 0.1.0)"
+    },
+    "composer": {
+      "version": "c0.1.1",
+      "params": 54582272,
+      "source": "dev v5.2 (variable-K 1..4, score conditioning removed)"
+    }
+  }
+}

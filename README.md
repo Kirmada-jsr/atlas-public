@@ -19,7 +19,7 @@ entirely in embedding space.
 ## Quickstart
 
 ```bash
-pip install "atlas-sonar @ git+https://github.com/Kirmada-jsr/atlas-public@v0.1.0"
+pip install "atlas-sonar @ git+https://github.com/Kirmada-jsr/atlas-public@v0.1.1"
 atlas ask "what is dobutamine used for?"
 ```
 
@@ -39,7 +39,7 @@ result.embedding   # the composed SONAR vector itself
 
 `atlas repl` gives you an interactive loop; `atlas serve` launches a local
 Gradio demo
-(`pip install "atlas-sonar[demo] @ git+https://github.com/Kirmada-jsr/atlas-public@v0.1.0"`).
+(`pip install "atlas-sonar[demo] @ git+https://github.com/Kirmada-jsr/atlas-public@v0.1.1"`).
 
 > **First run downloads ~6.5 GB** (weights ~55 MB, fact index ~5 GB, SONAR
 > encoder/decoder ~1.2 GB), cached under `~/.cache/huggingface`. Every later
@@ -60,8 +60,8 @@ Everything is a defaulted parameter — no source editing needed to experiment:
 
 | Parameter     | Default     | Meaning |
 |---------------|-------------|---------|
-| `k`           | `3`         | how many fact sentences to retrieve |
-| `score_mode`  | `"uniform"` | composer score conditioning; `"uniform"` matches how the composer was trained (recommended), `"retriever"` feeds raw retrieval scores instead |
+| `k`           | `4`         | how many fact sentences to retrieve |
+| `alpha`       | `0.0`       | selection threshold: keep sentence i iff `score_i >= alpha * score_1` (top-1 always kept; `<= 0` keeps all k); scores never enter the composer |
 | `n_neighbors` | `5`         | stored passages reported near the composed vector |
 | `decode`      | `True`      | set `False` to skip text decoding (retrieval + embedding only) |
 | `device`      | `"auto"`    | `cuda` > `mps` > `cpu` |
