@@ -108,6 +108,7 @@ installing from the git tag `vX.Y.Z` always loads the weights tagged
 The full technical report for each major release, covering architecture with
 tensor shapes, the end-to-end inference path, training procedure, and
 measured performance, lives in [release-reports/](release-reports/). Current:
+[ATLAS v0.2.0](release-reports/ATLAS_v0.2.0_Technical_Report.md). Previous:
 [ATLAS v0.1.0](release-reports/ATLAS_v0.1.0_Technical_Report.md).
 
 ## Citation
