@@ -107,17 +107,19 @@ class Sonar:
         emb: torch.Tensor,
         max_length: int = 64,
         num_beams: int = 4,
+        no_repeat_ngram_size: int = 3,
     ) -> str:
         """Decode a SONAR embedding (``[D]`` or ``[1, D]``) back to text.
 
         The embedding is injected as a single-position encoder output and
-        decoded with beam search, forced to ``lang_code``.
+        decoded with beam search, forced to ``lang_code``. Generation
+        settings match the validated dev inference script exactly.
         """
         decoder, tok = self._load_decoder()
         from transformers.modeling_outputs import BaseModelOutput
 
         pooled = emb.unsqueeze(0) if emb.dim() == 1 else emb
-        enc_out_seq = pooled.to(self.device).unsqueeze(1)
+        enc_out_seq = pooled.to(self.device, torch.float32).unsqueeze(1)
         encoder_outputs = BaseModelOutput(last_hidden_state=enc_out_seq)
         forced_bos = tok.convert_tokens_to_ids(self.lang_code)
         out_ids = decoder.generate(
@@ -125,6 +127,6 @@ class Sonar:
             forced_bos_token_id=forced_bos,
             max_length=max_length,
             num_beams=num_beams,
-            early_stopping=True,
+            no_repeat_ngram_size=no_repeat_ngram_size,
         )
         return tok.batch_decode(out_ids, skip_special_tokens=True)[0]

@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.2.0 - 2026-07-17
+
+Full pipeline replacement: new retriever (r0.2.0), new fact pool
+(index 0.2.0), and a two-head composer (grouping a0.2.0 + fusion b0.2.0).
+
+- **Adaptive-cardinality composer.** The single K-to-1 composer is replaced
+  by two heads: a pairwise fusability classifier (grouping, ~0.5M params)
+  clusters the retrieved facts into groups of up to 3 that can share one
+  fluent sentence, and a set-transformer fusion model (~53.5M params) fuses
+  each group into one SONAR vector. Each group decodes to its own sentence;
+  `answer` joins them into one paragraph. This fixes the single-vector
+  bottleneck where answers spanning several distinct facts garbled.
+- **New retriever and fact pool.** The pool grows from ~1.2M to ~8.6M
+  sentences and the retriever is retrained over it, then lightly fine-tuned
+  so Atlas can answer questions about itself and its creator; 75 identity
+  facts ship as part of the released memory. Retrieval depth is now `k=8`,
+  with near-duplicate removal by cosine (`dedup_threshold=0.5`) before
+  grouping.
+- **API.** `ask()` gains `dedup_threshold`, `fuse_threshold` and `max_group`.
+  `alpha`, `score_mode`, `n_neighbors` and passage grounding are removed;
+  the result fields (`retrieved`, `deduped`, `groups`, `sentences`) show how
+  the answer was assembled instead. `AtlasResult.embeddings` carries the
+  fused vector of every group.
+- **CLI.** New `--mode qa|verbose`: qa (default) prints only the answer
+  paragraph, verbose shows every pipeline stage. The repl toggles live
+  with `:v`.
+- **Footprint.** First-run download is ~38 GB (the pool is ~37 GB fp32) and
+  RAM use is ~40 GB. See the hardware table in the README.
+
 ## v0.1.1 - 2026-07-11
 
 New composer (c0.1.1), retriever unchanged (r0.1.0).

@@ -1,16 +1,19 @@
 """Atlas model definitions.
 
 Single source of truth for the three trainable modules. Architectures are
-checkpoint-compatible with the released Atlas weights — do not change layer
+checkpoint-compatible with the released Atlas weights: do not change layer
 shapes or module names, or ``load_state_dict`` will fail.
 
 All modules operate directly on raw SONAR embeddings (dim 1024). There is no
 intermediate latent space.
+
+v0.2.0 replaces the single K-to-1 composer with two heads. The grouping
+model decides which retrieved facts can share one fluent output sentence;
+the fusion model folds each group of up to 3 facts into one SONAR vector,
+decoded to one sentence per group.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -18,11 +21,10 @@ import torch.nn.functional as F
 
 SONAR_DIM = 1024
 QE_HIDDEN = 1024
-
-# Initial value of DotProductScorer.logit_scale: log(1 / 0.07), the standard
-# CLIP-style contrastive temperature. Only used during training; kept so the
-# released checkpoints load cleanly.
-_LOGIT_SCALE_INIT = 2.6593
+GROUPER_HIDDEN = 256
+FUSER_HIDDEN = 1024
+FUSER_LAYERS = 4
+FUSER_HEADS = 8
 
 
 class QueryEncoder(nn.Module):
@@ -46,81 +48,77 @@ class QueryEncoder(nn.Module):
         return F.normalize(self.net(x), dim=-1)
 
 
-class DotProductScorer(nn.Module):
-    """Cosine-similarity scorer with a learned temperature.
+class GroupingModel(nn.Module):
+    """Pairwise fusability classifier over two fact embeddings.
 
-    The temperature (``logit_scale``) is a training-time artifact of the
-    InfoNCE objective; at inference ``pairwise`` returns plain cosine
-    similarities. The parameter is retained for checkpoint compatibility.
+    Answers "can these two distinct facts share one fluent sentence?", which
+    is a different question from "are they near-duplicates" (near-duplicate
+    removal is done by a plain cosine threshold in the pipeline). A shared
+    projection ``phi`` embeds each fact; the classifier scores the pair from
+    ``[phi(a)+phi(b), phi(a)*phi(b), |phi(a)-phi(b)|]``, a combination that
+    makes the score symmetric in (a, b). Output is one logit; the pipeline
+    applies a sigmoid and thresholds it.
     """
 
-    def __init__(self):
+    def __init__(self, sonar_dim: int = SONAR_DIM, hidden: int = GROUPER_HIDDEN):
         super().__init__()
-        self.logit_scale = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
+        self.phi = nn.Sequential(
+            nn.Linear(sonar_dim, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.cls = nn.Sequential(
+            nn.Linear(3 * hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
 
-    def pairwise(self, z_pool: torch.Tensor, y_batch: torch.Tensor) -> torch.Tensor:
-        """Cosine similarity between every query and every pool vector.
-
-        Args:
-            z_pool:  ``[P, D]`` candidate fact embeddings.
-            y_batch: ``[B, D]`` query vectors.
-
-        Returns:
-            ``[B, P]`` similarity scores (higher = more relevant).
-        """
-        z_n = F.normalize(z_pool, dim=-1)
-        y_n = F.normalize(y_batch, dim=-1)
-        return y_n @ z_n.T
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        pa, pb = self.phi(a), self.phi(b)
+        pair = torch.cat([pa + pb, pa * pb, (pa - pb).abs()], dim=-1)
+        return self.cls(pair).squeeze(-1)
 
 
-class Composer(nn.Module):
-    """Folds K sentence SONAR embeddings into one paragraph-level embedding.
+class FusionModel(nn.Module):
+    """Fuses a group of up to 3 fact SONAR embeddings into one SONAR vector.
 
-    TransformerEncoder over the K inputs, mask-aware mean pooling, then an
-    output MLP. Output is a raw SONAR-space vector (no normalization)
-    suitable for the SONAR decoder.
-
-    Variable-K (c0.1.1): trained on K = 1..4 inputs; retrieval scores never
-    enter the composer (they only gate which facts reach it, via the alpha
-    selection rule in the pipeline).
+    Input projection, pre-LayerNorm TransformerEncoder over the group
+    members (padding slots hidden via the key-padding mask), mask-aware mean
+    pooling, then an output MLP back to SONAR space. The output vector is
+    decodable by the SONAR decoder into one fluent sentence covering the
+    group.
     """
 
     def __init__(
         self,
-        n_heads: int = 8,
-        n_layers: int = 4,
         sonar_dim: int = SONAR_DIM,
+        hidden: int = FUSER_HIDDEN,
+        n_layers: int = FUSER_LAYERS,
+        n_heads: int = FUSER_HEADS,
     ):
         super().__init__()
-        D = sonar_dim
-
+        self.inp = nn.Linear(sonar_dim, hidden)
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=D,
+            d_model=hidden,
             nhead=n_heads,
-            dim_feedforward=4 * D,
+            dim_feedforward=4 * hidden,
             dropout=0.0,
             activation="gelu",
             batch_first=True,
-            norm_first=False,
+            norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(D, 2 * D), nn.GELU(),
-            nn.Linear(2 * D, D),
+        # enable_nested_tensor=False only silences a construction-time warning:
+        # torch disables the nested-tensor fast path for norm_first layers
+        # anyway, so the compute path is identical.
+        self.tf = nn.TransformerEncoder(enc_layer, num_layers=n_layers, enable_nested_tensor=False)
+        self.out = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, sonar_dim),
         )
 
     def forward(
         self,
-        z_topk: torch.Tensor,                                # [B, K, D]
-        src_key_padding_mask: Optional[torch.Tensor] = None,  # [B, K] True = pad
-    ) -> torch.Tensor:                                       # [B, D]
-        h = self.transformer(z_topk, src_key_padding_mask=src_key_padding_mask)
-
-        if src_key_padding_mask is not None:
-            valid = (~src_key_padding_mask).float().unsqueeze(-1)
-            h = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
-        else:
-            h = h.mean(dim=1)
-
-        return self.mlp(h)
+        x: torch.Tensor,      # [B, N, D] group members, zero-padded to N slots
+        mask: torch.Tensor,   # [B, N] True = real member, False = padding
+    ) -> torch.Tensor:        # [B, D]
+        h = self.tf(self.inp(x), src_key_padding_mask=~mask)
+        pooled = (h * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+        return self.out(pooled)

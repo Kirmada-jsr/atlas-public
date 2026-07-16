@@ -1,23 +1,24 @@
 """Atlas inference pipeline.
 
-``Atlas.from_pretrained()`` downloads the released weights and fact index
+``Atlas.from_pretrained()`` downloads the released weights and fact pool
 from the Hugging Face Hub (pinned to the revision matching this package
 version) and assembles the full ask pipeline:
 
     question --SONAR encode--> query embedding
              --QueryEncoder + chunked cosine scan--> top-K fact sentences
-             --Composer--> paragraph-level SONAR embedding
-             --SONAR decode--> answer text
-             (+ nearest stored passages to the composed vector, for grounding)
+             --cosine dedup--> distinct facts (near-duplicates collapsed)
+             --GroupingModel--> groups of fusable facts (up to 3 per group)
+             --FusionModel, per group--> one fused SONAR vector per group
+             --SONAR decode, per group--> one sentence per group
 
-The retrieval / composition math is ported behavior-for-behavior from the
-validated dev inference script. Public-facing outputs are identical to it.
+The per-group sentences are joined into one answer paragraph. The retrieval,
+dedup, grouping and fusion math is ported behavior-for-behavior from the
+validated dev inference script; public-facing outputs are identical to it.
 
-v0.1.1: retrieval scores never enter the composer. They are used only to
-SELECT which retrieved sentences are composed, via the relative drop-off
-rule ``alpha``: keep sentence i iff score_i >= alpha * score_1 (top-1 is
-always kept; alpha <= 0 keeps all k). The composer takes a variable number
-of inputs (trained on K = 1..4).
+v0.2.0: retrieval scores never enter any model. They only rank the pool scan;
+which facts are composed together is decided by the cosine dedup and the
+learned grouping head. The fact pool includes a small set of Atlas identity
+facts, so Atlas can answer questions about itself and its creator.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from .models import Composer, DotProductScorer, QueryEncoder
+from .models import SONAR_DIM, FusionModel, GroupingModel, QueryEncoder
 from .sonar import DEFAULT_DECODER, DEFAULT_ENCODER, Sonar
 
 DEFAULT_MODEL_REPO = "kirmada-jsr/atlas"
@@ -36,14 +37,18 @@ DEFAULT_INDEX_REPO = "kirmada-jsr/atlas-index"
 
 # Filenames inside the HF repos (written by scripts/upload_to_hf.py).
 RETRIEVER_FILE = "retriever.pt"
-COMPOSER_FILE = "composer.pt"
-ENCODED_FILE = "msmarco_encoded.pt"
-PARA_TARGETS_FILE = "para_targets.pt"
+MODEL_A_FILE = "model_a.pt"
+MODEL_B_FILE = "model_b.pt"
+POOL_FILE = "pool.pt"
+IDENTITY_POOL_FILE = "identity_pool.pt"
 MANIFEST_FILE = "manifest.json"
 
-# Retained for backward compatibility only; score_mode is deprecated and
-# ignored (the c0.1.1 composer takes no scores).
-_SCORE_MODES = ("uniform", "retriever")
+# Validated inference defaults (see ask()).
+DEFAULT_K = 8
+DEFAULT_DEDUP_THRESHOLD = 0.5
+DEFAULT_FUSE_THRESHOLD = 0.5
+DEFAULT_MAX_GROUP = 3
+DEFAULT_CHUNK_SIZE = 200_000
 
 
 def _resolve_device(device: str | torch.device) -> torch.device:
@@ -70,44 +75,39 @@ class AtlasResult:
     """Everything one ``ask()`` call produced."""
 
     question: str
-    answer: Optional[str]                      # decoded paragraph; None if decode=False
-    retrieved: List[Tuple[str, float]]         # (sentence, raw retriever cosine score)
+    answer: Optional[str]                      # per-group sentences joined into a paragraph; None if decode=False
+    sentences: List[str] = field(default_factory=list)  # one decoded sentence per group
+    retrieved: List[Tuple[str, float]] = field(default_factory=list)  # (sentence, retriever cosine score), top-k
     retrieved_indices: List[int] = field(default_factory=list)  # pool indices of `retrieved`
-    kept: List[bool] = field(default_factory=list)  # alpha-selection survivors (composed subset)
-    passages: List[Dict] = field(default_factory=list)
-    # each: {"question": str, "sentences": List[str], "similarity": float,
-    #        "index": int}
-    embedding: Optional[torch.Tensor] = None   # composed SONAR vector [D], CPU
+    deduped: List[str] = field(default_factory=list)  # distinct facts after cosine dedup
+    deduped_indices: List[int] = field(default_factory=list)  # pool indices of `deduped`
+    groups: List[List[int]] = field(default_factory=list)  # index into `deduped`, one list per group
+    embeddings: Optional[torch.Tensor] = None  # fused SONAR vectors [G, D], CPU
 
 
 class Atlas:
-    """Pretrained Atlas: retrieval + composition over a SONAR fact memory."""
+    """Pretrained Atlas: retrieval, grouping and fusion over a SONAR fact memory."""
 
     def __init__(
         self,
         query_enc: QueryEncoder,
-        scorer: DotProductScorer,
-        composer: Composer,
-        data: Dict,
+        grouper: GroupingModel,
+        fuser: FusionModel,
+        sentences: List[str],
+        sent_embs: torch.Tensor,
         sonar: Sonar,
         device: torch.device,
-        chunk_size: int = 4096,
-        alpha: float = 0.0,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
     ):
         self.query_enc = query_enc
-        self.scorer = scorer
-        self.composer = composer
+        self.grouper = grouper
+        self.fuser = fuser
+        self.sentences = sentences
+        self.sent_embs = sent_embs        # [S, D]
         self.sonar = sonar
         self.device = device
         self.chunk_size = chunk_size
-        self.alpha = alpha
         self.manifest: Optional[Dict] = None
-
-        self.questions: List[str] = data["questions"]
-        self.sentences: List[str] = data["sentences"]
-        self.sent_embs: torch.Tensor = data["sent_embs"]        # [S, D]
-        self.sent_ranges: List[Tuple[int, int]] = data["sent_ranges"]
-        self.para_targets: torch.Tensor = data["para_targets"]  # [N, D]
 
     # ------------------------------------------------------------------
     # Loading
@@ -123,26 +123,23 @@ class Atlas:
         pool_device: Optional[str] = None,
         encoder_model: str = DEFAULT_ENCODER,
         decoder_model: str = DEFAULT_DECODER,
-        chunk_size: int = 4096,
-        alpha: float = 0.0,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> "Atlas":
-        """Download weights + fact index from the HF Hub and build the pipeline.
+        """Download weights + fact pool from the HF Hub and build the pipeline.
 
         Args:
-            model_repo:  HF model repo with ``retriever.pt`` / ``composer.pt``.
-            index_repo:  HF dataset repo with the fact pool
-                         (``msmarco_encoded.pt`` / ``para_targets.pt``).
+            model_repo:  HF model repo with ``retriever.pt`` / ``model_a.pt``
+                         / ``model_b.pt``.
+            index_repo:  HF dataset repo with the fact pool (``pool.pt`` and
+                         ``identity_pool.pt``).
             revision:    HF revision. Defaults to the tag matching this
-                         package version (e.g. ``v0.1.1``) so code and weights
+                         package version (e.g. ``v0.2.0``) so code and weights
                          can never mismatch. Pass ``"main"`` to track latest.
             device:      ``"auto"`` (cuda > mps > cpu), or explicit.
             pool_device: Optionally keep the fact pool resident on this device
                          (e.g. ``"cuda"``) instead of streaming CPU->GPU chunks
                          per query. Identical results, more memory.
             chunk_size:  Sentences per scoring chunk during retrieval.
-            alpha:       Default selection threshold for ``ask()``: keep
-                         retrieved sentence i iff score_i >= alpha * score_1
-                         (top-1 always kept; <= 0 keeps all k).
         """
         import json
 
@@ -154,9 +151,10 @@ class Atlas:
 
         try:
             retriever_path = hf_hub_download(model_repo, RETRIEVER_FILE, revision=rev)
-            composer_path = hf_hub_download(model_repo, COMPOSER_FILE, revision=rev)
-            encoded_path = hf_hub_download(index_repo, ENCODED_FILE, repo_type="dataset", revision=rev)
-            para_path = hf_hub_download(index_repo, PARA_TARGETS_FILE, repo_type="dataset", revision=rev)
+            model_a_path = hf_hub_download(model_repo, MODEL_A_FILE, revision=rev)
+            model_b_path = hf_hub_download(model_repo, MODEL_B_FILE, revision=rev)
+            pool_path = hf_hub_download(index_repo, POOL_FILE, repo_type="dataset", revision=rev)
+            identity_path = hf_hub_download(index_repo, IDENTITY_POOL_FILE, repo_type="dataset", revision=rev)
         except (RevisionNotFoundError, RepositoryNotFoundError, EntryNotFoundError) as e:
             raise RuntimeError(
                 f"Could not fetch Atlas artifacts at revision {rev!r} "
@@ -172,15 +170,18 @@ class Atlas:
         query_enc = QueryEncoder().to(dev)
         query_enc.load_state_dict(r_ckpt["query_enc"])
         query_enc.eval()
-        scorer = DotProductScorer().to(dev)
-        scorer.load_state_dict(r_ckpt["scorer"])
-        scorer.eval()
 
-        print(f"  Loading composer from {composer_path}...")
-        c_ckpt = torch.load(composer_path, map_location=dev, weights_only=False)
-        composer = Composer().to(dev)
-        composer.load_state_dict(c_ckpt["composer"])
-        composer.eval()
+        print(f"  Loading grouping model from {model_a_path}...")
+        a_ckpt = torch.load(model_a_path, map_location=dev, weights_only=False)
+        grouper = GroupingModel().to(dev)
+        grouper.load_state_dict(a_ckpt["model"])
+        grouper.eval()
+
+        print(f"  Loading fusion model from {model_b_path}...")
+        b_ckpt = torch.load(model_b_path, map_location=dev, weights_only=False)
+        fuser = FusionModel().to(dev)
+        fuser.load_state_dict(b_ckpt["model"])
+        fuser.eval()
 
         # --- component manifest (descriptive provenance; optional) ---
         manifest = None
@@ -192,100 +193,135 @@ class Atlas:
             comp_str = "  ".join(f"{name}={c.get('version', '?')}" for name, c in comps.items())
             print(f"  Components: {comp_str}")
         except EntryNotFoundError:
-            pass  # pre-manifest releases (v0.1.0)
+            pass
 
-        # --- fact index (kept on CPU unless pool_device is set) ---
-        print("  Loading fact index (this can take a minute)...")
-        data = torch.load(encoded_path, map_location="cpu", weights_only=False)
-        pt = torch.load(para_path, map_location="cpu", weights_only=False)
-        data["para_targets"] = pt["para_targets"]
-        # Training-only tensors; not used at inference. Freed to save RAM
+        # --- fact pool (kept on CPU unless pool_device is set) ---
+        print("  Loading fact pool (36 GB; this can take a few minutes)...")
+        pool = torch.load(pool_path, map_location="cpu", weights_only=False)
+        sentences = list(pool["sentences"])
+        sent_embs = pool["sent_embs"]
+        # Passage bookkeeping tensors are training-only; freed to save RAM
         # (no effect on any output).
-        data.pop("q_embs", None)
-        pt.pop("first3_indices", None)
-        pt.pop("firstK_indices", None)
+        pool.pop("sent_ranges", None)
+        pool.pop("passage_lane", None)
+
+        # The identity facts are part of the released memory: always appended.
+        idp = torch.load(identity_path, map_location="cpu", weights_only=False)
+        sent_embs = torch.cat([sent_embs, idp["embs"].to(sent_embs.dtype)], dim=0)
+        sentences = sentences + list(idp["sentences"])
 
         if pool_device is not None:
-            pd = torch.device(pool_device)
-            data["sent_embs"] = data["sent_embs"].to(pd)
-            data["para_targets"] = data["para_targets"].to(pd)
+            sent_embs = sent_embs.to(torch.device(pool_device))
 
         print(
-            f"  Atlas ready. Passages: {len(data['questions'])}  "
-            f"Sentences: {data['sent_embs'].shape[0]}  Device: {dev}"
+            f"  Atlas ready. Sentences: {sent_embs.shape[0]:,}  Device: {dev}"
         )
 
         sonar = Sonar(encoder_model, decoder_model, device=dev)
-        atlas = cls(query_enc, scorer, composer, data, sonar, dev, chunk_size, alpha)
+        atlas = cls(query_enc, grouper, fuser, sentences, sent_embs, sonar, dev, chunk_size)
         atlas.manifest = manifest
         return atlas
 
     # ------------------------------------------------------------------
-    # Retrieval
+    # Pipeline stages
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _retrieve_topk(self, q_emb: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-k fact sentences for one query embedding ``[1, D]``.
 
-        Chunked full-pool cosine scan; GPU memory stays bounded regardless of
-        pool size. Returns ``(scores [k], indices [k])`` on CPU.
+        Chunked full-pool cosine scan in fp16; device memory stays bounded
+        regardless of pool size. Returns ``(scores [k], indices [k])`` on CPU.
         """
-        y = self.query_enc(q_emb.to(self.device))
-        y_n = F.normalize(y, dim=-1)
+        y = self.query_enc(q_emb.to(self.device)).to(torch.float16)
         S = self.sent_embs.shape[0]
 
-        best_scores = torch.full((k,), float("-inf"), device=self.device)
+        best_scores = torch.full((k,), -1e4, device=self.device, dtype=torch.float16)
         best_indices = torch.zeros(k, dtype=torch.long, device=self.device)
 
         for start in range(0, S, self.chunk_size):
             end = min(start + self.chunk_size, S)
-            chunk = self.sent_embs[start:end].to(self.device, non_blocking=True)
-            chunk_n = F.normalize(chunk, dim=-1)
-            sims = (y_n @ chunk_n.T).squeeze(0)
+            chunk = self.sent_embs[start:end].to(self.device, torch.float16)
+            chunk = chunk / chunk.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            sims = (y @ chunk.T).squeeze(0)
 
-            chunk_idx = torch.arange(start, end, device=self.device)
             combined_scores = torch.cat([best_scores, sims])
-            combined_indices = torch.cat([best_indices, chunk_idx])
+            combined_indices = torch.cat([best_indices, torch.arange(start, end, device=self.device)])
             top_scores, top_pos = combined_scores.topk(k, largest=True)
             best_scores = top_scores
             best_indices = combined_indices[top_pos]
 
         return best_scores.cpu(), best_indices.cpu()
 
+    def _dedup(self, pool_indices: List[int], threshold: float) -> List[int]:
+        """Collapse near-duplicate retrieved facts by cosine similarity.
+
+        Greedy: walk the facts in retrieval order, join the first cluster the
+        fact is similar (>= threshold) to every member of, else start a new
+        cluster. Returns the position (into ``pool_indices``) of each
+        cluster's first member.
+        """
+        E = F.normalize(self.sent_embs[torch.tensor(pool_indices)].float(), dim=-1)
+        C = (E @ E.T).tolist()
+        clusters: List[List[int]] = []
+        for i in range(len(pool_indices)):
+            placed = False
+            for cl in clusters:
+                if all(C[i][m] >= threshold for m in cl):
+                    cl.append(i)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([i])
+        return [cl[0] for cl in clusters]
+
     @torch.no_grad()
-    def _nearest_passages(
-        self,
-        composed_emb: torch.Tensor,
-        n: int,
-        chunk_size: int = 8192,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The n stored passages whose para-embedding is closest to ``composed_emb``."""
-        c_n = F.normalize(composed_emb.unsqueeze(0).to(self.device), dim=-1)
-        N = self.para_targets.shape[0]
-        best_sims = torch.full((n,), float("-inf"), device=self.device)
-        best_indices = torch.zeros(n, dtype=torch.long, device=self.device)
+    def _group(self, pool_indices: List[int], threshold: float, max_group: int) -> List[List[int]]:
+        """Cluster distinct facts into fusable groups with the grouping model.
 
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            chunk = F.normalize(self.para_targets[start:end].to(self.device), dim=-1)
-            sims = (c_n @ chunk.T).squeeze(0)
-            chunk_idx = torch.arange(start, end, device=self.device)
-            combined_sims = torch.cat([best_sims, sims])
-            combined_indices = torch.cat([best_indices, chunk_idx])
-            top_sims, top_pos = combined_sims.topk(n, largest=True)
-            best_sims = top_sims
-            best_indices = combined_indices[top_pos]
+        Greedy over pairwise fusability probabilities: a fact joins the first
+        group it is fusable (sigmoid >= threshold) with every member of, if
+        that group has room (< max_group); else it starts a new group.
+        Returns groups of positions into ``pool_indices``.
+        """
+        E = self.sent_embs[torch.tensor(pool_indices)].float().to(self.device)
+        n = len(pool_indices)
+        P = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                p = torch.sigmoid(self.grouper(E[i:i + 1], E[j:j + 1])).item()
+                P[i][j] = P[j][i] = p
 
-        return best_sims.cpu(), best_indices.cpu()
+        groups: List[List[int]] = []
+        for i in range(n):
+            placed = False
+            for grp in groups:
+                if len(grp) < max_group and all(P[i][m] >= threshold for m in grp):
+                    grp.append(i)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([i])
+        return groups
+
+    @torch.no_grad()
+    def _fuse(self, pool_indices: List[int], max_group: int) -> torch.Tensor:
+        """Fuse one group of facts into a single SONAR vector ``[D]``."""
+        members = pool_indices[:max_group]
+        embs = self.sent_embs[torch.tensor(members)].float()
+        x = torch.zeros(1, max_group, SONAR_DIM, device=embs.device)
+        mask = torch.zeros(1, max_group, dtype=torch.bool, device=embs.device)
+        x[0, :len(members)] = embs
+        mask[0, :len(members)] = True
+        return self.fuser(x.to(self.device), mask.to(self.device))[0]
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def retrieve(self, question: str, k: int = 4) -> List[Tuple[str, float]]:
-        """Retrieve the top-k fact sentences for a question (no composition)."""
+    def retrieve(self, question: str, k: int = DEFAULT_K) -> List[Tuple[str, float]]:
+        """Retrieve the top-k fact sentences for a question (no fusion)."""
         q_emb = self.sonar.encode(question)
         top_scores, top_indices = self._retrieve_topk(q_emb, k)
         return [
@@ -297,76 +333,50 @@ class Atlas:
     def ask(
         self,
         question: str,
-        k: int = 4,
-        alpha: Optional[float] = None,
-        n_neighbors: int = 5,
+        k: int = DEFAULT_K,
+        dedup_threshold: float = DEFAULT_DEDUP_THRESHOLD,
+        fuse_threshold: float = DEFAULT_FUSE_THRESHOLD,
+        max_group: int = DEFAULT_MAX_GROUP,
         decode: bool = True,
-        score_mode: Optional[str] = None,
     ) -> AtlasResult:
-        """Full pipeline: encode -> retrieve top-k -> select -> compose -> decode.
+        """Full pipeline: retrieve top-k, dedup, group, fuse and decode.
 
         Args:
-            question:    Natural-language question.
-            k:           Number of fact sentences to retrieve.
-            alpha:       Selection threshold: keep sentence i iff
-                         score_i >= alpha * score_1 (top-1 always kept;
-                         <= 0 keeps all k). Defaults to the instance
-                         ``alpha`` set at load time.
-            n_neighbors: Stored passages to report near the composed vector.
-            decode:      If False, skip SONAR decoding (``answer`` is None).
-            score_mode:  Deprecated and ignored. The composer no longer takes
-                         scores; retrieval scores only gate selection (alpha).
+            question:        Natural-language question.
+            k:               Number of fact sentences to retrieve.
+            dedup_threshold: Cosine similarity at or above which two retrieved
+                             facts count as near-duplicates and collapse.
+            fuse_threshold:  Fusability probability at or above which two
+                             distinct facts may share one output sentence.
+            max_group:       Maximum facts fused into one sentence.
+            decode:          If False, skip SONAR decoding (``answer`` and
+                             ``sentences`` are empty; fused ``embeddings``
+                             are still returned).
         """
-        if score_mode is not None:
-            import warnings
-
-            warnings.warn(
-                "score_mode is deprecated and ignored: the composer no longer "
-                "takes scores. Use alpha to control fact selection instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        a = self.alpha if alpha is None else alpha
-
-        # Encode + retrieve
         q_emb = self.sonar.encode(question)
         top_scores, top_indices = self._retrieve_topk(q_emb, k)
+        idxs = top_indices.tolist()
 
-        # Select by the relative drop-off rule, then compose the survivors.
-        # Scores are used only for this selection; they never enter the
-        # composer.
-        if a > 0:
-            keep = top_scores >= a * top_scores[0]
-            keep[0] = True
-        else:
-            keep = torch.ones_like(top_scores, dtype=torch.bool)
+        reps = self._dedup(idxs, dedup_threshold)
+        deduped_idx = [idxs[r] for r in reps]
 
-        z_kept = self.sent_embs[top_indices[keep]].unsqueeze(0).to(self.device)
-        composed = self.composer(z_kept).squeeze(0).cpu()
+        groups = self._group(deduped_idx, fuse_threshold, max_group)
+        fused = [self._fuse([deduped_idx[i] for i in grp], max_group) for grp in groups]
 
-        # Grounding: nearest stored passages to the composed vector
-        near_sims, near_idxs = self._nearest_passages(composed, n=n_neighbors)
-        passages = []
-        for sim, ni in zip(near_sims.tolist(), near_idxs.tolist()):
-            s, e = self.sent_ranges[ni]
-            passages.append({
-                "question": self.questions[ni],
-                "sentences": self.sentences[s:e],
-                "similarity": sim,
-                "index": ni,
-            })
-
-        answer = self.sonar.decode(composed) if decode else None
+        sentences = [self.sonar.decode(v) for v in fused] if decode else []
+        answer = " ".join(sentences) if decode else None
 
         return AtlasResult(
             question=question,
             answer=answer,
+            sentences=sentences,
             retrieved=[
                 (self.sentences[i], s)
-                for i, s in zip(top_indices.tolist(), top_scores.tolist())
+                for i, s in zip(idxs, top_scores.tolist())
             ],
-            retrieved_indices=top_indices.tolist(),
-            kept=keep.tolist(),
-            passages=passages,
-            embedding=composed,
+            retrieved_indices=idxs,
+            deduped=[self.sentences[i] for i in deduped_idx],
+            deduped_indices=deduped_idx,
+            groups=groups,
+            embeddings=torch.stack([v.cpu() for v in fused]) if fused else None,
         )

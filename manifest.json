@@ -1,19 +1,24 @@
 {
-  "version": "0.1.1",
+  "version": "0.2.0",
   "components": {
     "index": {
-      "version": "0.1.1",
-      "source": "dev v5.2 (para_targets rebuilt first-4; sentence pool unchanged from 0.1.0)"
+      "version": "0.2.0",
+      "source": "dev v5.3 pool (8,615,405 sentences) + 75 identity facts"
     },
     "retriever": {
-      "version": "r0.1.0",
-      "params": 3150849,
-      "source": "dev v5.1 canonical (unchanged from 0.1.0)"
+      "version": "r0.2.0",
+      "params": 3150848,
+      "source": "dev v5.3 (arm_seed42 + identity fine-tune, retrieval-mined hard negatives with anchor loss)"
     },
-    "composer": {
-      "version": "c0.1.1",
-      "params": 54582272,
-      "source": "dev v5.2 (variable-K 1..4, score conditioning removed)"
+    "grouping": {
+      "version": "a0.2.0",
+      "params": 525313,
+      "source": "dev v5.4 Model A (pairwise fusability classifier, LLM-distilled labels)"
+    },
+    "fusion": {
+      "version": "b0.2.0",
+      "params": 53533696,
+      "source": "dev v5.4 Model B balanced-big (set transformer Hd=1024 L=4 pre-LN, LLM-distilled fusion targets)"
     }
   }
 }

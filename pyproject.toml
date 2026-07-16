@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atlas-sonar"
-version = "0.1.1"
-description = "Atlas: retrieval and composition in SONAR embedding space — ask questions against a pretrained fact memory."
+version = "0.2.0"
+description = "Atlas: retrieval, grouping and fusion in SONAR embedding space. Ask questions against a pretrained fact memory."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

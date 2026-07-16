@@ -1,6 +1,6 @@
 """Atlas: retrieval and composition in SONAR embedding space."""
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 from .pipeline import Atlas, AtlasResult  # noqa: E402
 

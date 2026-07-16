@@ -1,22 +1,36 @@
 """Atlas command-line interface.
 
     atlas ask "what is dobutamine used for?"
+    atlas ask "who created atlas?" --mode verbose
     atlas repl
     atlas serve            # Gradio demo (pip install atlas-sonar[demo])
 
 Loading flags (shared by all subcommands) mirror ``Atlas.from_pretrained``;
 per-question flags mirror ``Atlas.ask``. Defaults are the validated ones.
+
+Two output modes: ``qa`` (default) prints only the answer paragraph;
+``verbose`` shows every pipeline stage (retrieved top-k, distinct facts
+after dedup, groups, and the per-group fused sentences). The repl toggles
+between them live with ``:v``.
 """
 
 from __future__ import annotations
 
 import argparse
 import textwrap
+import time
 
-import torch
-import torch.nn.functional as F
-
-from .pipeline import DEFAULT_INDEX_REPO, DEFAULT_MODEL_REPO, Atlas, AtlasResult
+from .pipeline import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_DEDUP_THRESHOLD,
+    DEFAULT_FUSE_THRESHOLD,
+    DEFAULT_INDEX_REPO,
+    DEFAULT_K,
+    DEFAULT_MAX_GROUP,
+    DEFAULT_MODEL_REPO,
+    Atlas,
+    AtlasResult,
+)
 
 WRAP = 100
 
@@ -30,46 +44,59 @@ def _div(c: str = "─") -> str:
     return c * WRAP
 
 
-def _short(text: str, n: int = 200) -> str:
-    return text if len(text) <= n else text[:n] + "…"
+def _print_qa(result: AtlasResult) -> None:
+    print()
+    print(_w(result.answer or "", indent="  "))
 
 
-def _print_result(atlas: Atlas, result: AtlasResult, k: int, n_neighbors: int) -> None:
-    """Render one ask() result — same layout as the validated dev interactive mode."""
-    n_kept = sum(result.kept) if result.kept else k
-    print(_div("─"))
-    print(f"  TOP-{k} RETRIEVED SENTENCES  ({n_kept} kept)")
-    print(_div("─"))
+def _print_verbose(result: AtlasResult, elapsed: float) -> None:
+    """Render every pipeline stage, same layout as the validated dev harness."""
+    print(_div())
+    print(f"  TOP-{len(result.retrieved)} RETRIEVED SENTENCES")
+    print(_div())
     for rank, (sentence, score) in enumerate(result.retrieved, start=1):
-        kept = result.kept[rank - 1] if result.kept else True
-        print(f"  Rank {rank}  score={score:.4f}  {'KEPT' if kept else 'dropped'}")
+        print(f"  Rank {rank}  score={score:.4f}")
         print(_w(sentence))
+
+    print()
+    print(_div())
+    print(f"  {len(result.deduped)} DISTINCT FACTS (cosine dedup)")
+    print(_div())
+    for s in result.deduped:
+        print(_w(s))
+
+    print()
+    print(_div())
+    print(f"  GROUPING -> {len(result.groups)} GROUPS")
+    print(_div())
+    for grp, sent in zip(result.groups, result.sentences):
+        tag = f"fuse{grp}" if len(grp) > 1 else f"solo[{grp[0]}]"
+        print(f"  {tag}:")
+        print(_w(sent))
 
     if result.answer is not None:
         print()
-        print(_div("─"))
-        print("  COMPOSER DECODE")
-        print(_div("─"))
-        print(_w(result.answer))
+        print(_div())
+        print("  ANSWER")
+        print(_div())
+        print(_w(result.answer, indent="  "))
 
-    print()
-    print(_div("─"))
-    print("  NEAREST PASSAGES TO COMPOSED OUTPUT")
-    print(_div("─"))
-    for rank, p in enumerate(result.passages, start=1):
-        print(f"\n  {rank}. Similarity={p['similarity']:.4f}")
-        print(f"     Q: {_short(p['question'], 120)}")
-        for s in p["sentences"]:
-            print(_w(s, indent="     "))
+    print(f"\n  ({elapsed:.1f}s)")
 
-    print()
-    print(_div("─"))
-    comp_to_pool_sims = F.cosine_similarity(
-        F.normalize(result.embedding.unsqueeze(0), dim=-1),
-        F.normalize(atlas.sent_embs[torch.tensor(result.retrieved_indices)].cpu(), dim=-1),
+
+def _ask_and_print(atlas: Atlas, question: str, args: argparse.Namespace, mode: str) -> None:
+    t0 = time.time()
+    result = atlas.ask(
+        question,
+        k=args.k,
+        dedup_threshold=args.dedup_threshold,
+        fuse_threshold=args.fuse_threshold,
+        max_group=args.max_group,
     )
-    print("  Composed vector similarity to retrieved sentences: "
-          + "  ".join(f"s{i+1}={v:.3f}" for i, v in enumerate(comp_to_pool_sims.tolist())))
+    if mode == "verbose":
+        _print_verbose(result, time.time() - t0)
+    else:
+        _print_qa(result)
 
 
 def _load(args: argparse.Namespace) -> Atlas:
@@ -80,21 +107,12 @@ def _load(args: argparse.Namespace) -> Atlas:
         device=args.device,
         pool_device=args.pool_device,
         chunk_size=args.chunk_size,
-        alpha=getattr(args, "alpha", 0.0),
     )
 
 
 def _cmd_ask(args: argparse.Namespace) -> None:
     atlas = _load(args)
-    result = atlas.ask(
-        args.question,
-        k=args.k,
-        score_mode=args.score_mode,
-        n_neighbors=args.n_neighbors,
-        decode=not args.no_decode,
-    )
-    print()
-    _print_result(atlas, result, args.k, args.n_neighbors)
+    _ask_and_print(atlas, args.question, args, args.mode)
 
 
 def _cmd_version(args: argparse.Namespace) -> None:
@@ -121,33 +139,30 @@ def _cmd_version(args: argparse.Namespace) -> None:
 
 def _cmd_repl(args: argparse.Namespace) -> None:
     atlas = _load(args)
+    mode = args.mode
     print("\n" + "=" * WRAP)
     print("  Atlas Interactive Mode")
-    print("  Type a question and press Enter. Type 'quit' to exit.")
+    print("  Type a question and press Enter. ':v' toggles verbose, 'quit' exits.")
     print("=" * WRAP)
 
     while True:
         try:
-            question = input("\n  Question: ").strip()
+            question = input("\natlas> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  Exiting.")
             break
 
         if not question:
             continue
-        if question.lower() in {"quit", "exit", "q"}:
+        if question.lower() in {":q", "quit", "exit", "q"}:
             print("  Exiting.")
             break
+        if question.lower() == ":v":
+            mode = "verbose" if mode == "qa" else "qa"
+            print(f"  [mode={mode}]")
+            continue
 
-        print()
-        result = atlas.ask(
-            question,
-            k=args.k,
-            score_mode=args.score_mode,
-            n_neighbors=args.n_neighbors,
-            decode=not args.no_decode,
-        )
-        _print_result(atlas, result, args.k, args.n_neighbors)
+        _ask_and_print(atlas, question, args, mode)
 
 
 def build_demo(atlas: Atlas | None = None, **load_kwargs):
@@ -162,32 +177,29 @@ def build_demo(atlas: Atlas | None = None, **load_kwargs):
     if atlas is None:
         atlas = Atlas.from_pretrained(**load_kwargs)
 
-    def _answer(question: str, k: int, alpha: float):
+    def _answer(question: str, k: int):
         if not question.strip():
             return "", "", ""
-        result = atlas.ask(question.strip(), k=int(k), alpha=float(alpha))
+        result = atlas.ask(question.strip(), k=int(k))
         retrieved = "\n\n".join(
-            f"[{i+1}] (score={s:.4f}, {'kept' if result.kept[i] else 'dropped'})  {sent}"
+            f"[{i+1}] (score={s:.4f})  {sent}"
             for i, (sent, s) in enumerate(result.retrieved)
         )
-        passages = "\n\n".join(
-            f"[{i+1}] (sim={p['similarity']:.4f})  Q: {p['question']}\n"
-            + "\n".join(f"    {s}" for s in p["sentences"])
-            for i, p in enumerate(result.passages)
+        groups = "\n\n".join(
+            f"[{'fuse' if len(grp) > 1 else 'solo'} {grp}]  {sent}\n"
+            + "\n".join(f"    <- {result.deduped[i]}" for i in grp)
+            for grp, sent in zip(result.groups, result.sentences)
         )
-        return result.answer or "", retrieved, passages
+        return result.answer or "", groups, retrieved
 
     with gr.Blocks(title="Atlas") as demo:
-        gr.Markdown("# Atlas\nRetrieval + composition in SONAR embedding space.")
+        gr.Markdown("# Atlas\nRetrieval, grouping and fusion in SONAR embedding space.")
         question = gr.Textbox(label="Question", placeholder="what is dobutamine used for?")
-        with gr.Row():
-            k = gr.Slider(1, 10, value=4, step=1, label="k (retrieved sentences)")
-            alpha = gr.Slider(0.0, 1.0, value=0.0, step=0.05,
-                              label="alpha (selection threshold; 0 keeps all)")
-        answer = gr.Textbox(label="Composed answer (SONAR decode)")
-        retrieved = gr.Textbox(label="Retrieved sentences", lines=6)
-        passages = gr.Textbox(label="Nearest stored passages", lines=10)
-        question.submit(_answer, [question, k, alpha], [answer, retrieved, passages])
+        k = gr.Slider(1, 16, value=DEFAULT_K, step=1, label="k (retrieved sentences)")
+        answer = gr.Textbox(label="Answer")
+        groups = gr.Textbox(label="Groups (fused sentence <- source facts)", lines=8)
+        retrieved = gr.Textbox(label="Retrieved sentences", lines=8)
+        question.submit(_answer, [question, k], [answer, groups, retrieved])
 
     return demo
 
@@ -205,34 +217,34 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(prog="atlas", description="Atlas — ask questions against a pretrained SONAR fact memory.")
+    p = argparse.ArgumentParser(prog="atlas", description="Atlas: ask questions against a pretrained SONAR fact memory.")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp: argparse.ArgumentParser, with_ask_opts: bool = True) -> None:
         sp.add_argument("--model-repo", default=DEFAULT_MODEL_REPO,
                         help=f"HF model repo (default {DEFAULT_MODEL_REPO})")
         sp.add_argument("--index-repo", default=DEFAULT_INDEX_REPO,
-                        help=f"HF dataset repo with the fact index (default {DEFAULT_INDEX_REPO})")
+                        help=f"HF dataset repo with the fact pool (default {DEFAULT_INDEX_REPO})")
         sp.add_argument("--revision", default=None,
                         help="HF revision (default: tag matching this package version)")
         sp.add_argument("--device", default="auto", help="auto | cpu | cuda | mps (default auto)")
         sp.add_argument("--pool-device", default=None,
                         help="Keep the fact pool resident on this device (e.g. cuda). Default: CPU, streamed.")
-        sp.add_argument("--chunk-size", type=int, default=4096,
-                        help="Sentences per scoring chunk (default 4096)")
+        sp.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
+                        help=f"Sentences per scoring chunk (default {DEFAULT_CHUNK_SIZE})")
         if with_ask_opts:
-            sp.add_argument("--k", type=int, default=4, help="Retrieved sentences (default 4)")
-            sp.add_argument("--alpha", type=float, default=0.0,
-                            help="Selection threshold: keep sentence i iff "
-                                 "score_i >= alpha * score_1 (top-1 always kept; "
-                                 "<= 0 keeps all k; default 0.0)")
-            sp.add_argument("--score-mode", choices=["uniform", "retriever"], default=None,
-                            help="Deprecated and ignored (the composer no longer takes "
-                                 "scores); use --alpha instead")
-            sp.add_argument("--n-neighbors", type=int, default=5,
-                            help="Nearest stored passages to show (default 5)")
-            sp.add_argument("--no-decode", action="store_true",
-                            help="Skip SONAR decoding (retrieval + embedding only)")
+            sp.add_argument("--mode", choices=["qa", "verbose"], default="qa",
+                            help="qa prints only the answer; verbose shows every pipeline stage")
+            sp.add_argument("--k", type=int, default=DEFAULT_K,
+                            help=f"Retrieved sentences (default {DEFAULT_K})")
+            sp.add_argument("--dedup-threshold", type=float, default=DEFAULT_DEDUP_THRESHOLD,
+                            help="Cosine similarity at or above which retrieved facts "
+                                 f"collapse as near-duplicates (default {DEFAULT_DEDUP_THRESHOLD})")
+            sp.add_argument("--fuse-threshold", type=float, default=DEFAULT_FUSE_THRESHOLD,
+                            help="Fusability probability at or above which two facts may "
+                                 f"share one output sentence (default {DEFAULT_FUSE_THRESHOLD})")
+            sp.add_argument("--max-group", type=int, default=DEFAULT_MAX_GROUP,
+                            help=f"Maximum facts fused into one sentence (default {DEFAULT_MAX_GROUP})")
 
     sp_ask = sub.add_parser("ask", help="Ask a single question")
     sp_ask.add_argument("question", help="The question to ask")
