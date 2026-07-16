@@ -1,7 +1,7 @@
 """Atlas command-line interface.
 
     atlas ask "what is dobutamine used for?"
-    atlas ask "who created atlas?" --mode verbose
+    atlas ask "how do vaccines work?" --mode verbose
     atlas repl
     atlas serve            # Gradio demo (pip install atlas-sonar[demo])
 
